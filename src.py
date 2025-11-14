@@ -1,682 +1,901 @@
 
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from PIL import Image, ImageTk, ImageEnhance
 import os
-import sys
-import io
-import shutil
-import datetime
-import tempfile
-import webbrowser
-from pathlib import Path
-from tkinter import (
-    Tk, Frame, Menu, Button, Label, Text, BOTH, LEFT, RIGHT, TOP, BOTTOM, X, Y, NW,
-    filedialog, messagebox, ttk, StringVar, Toplevel
-)
-from PIL import Image, ImageTk, ImageChops, ImageOps
-import piexif
 import numpy as np
 import cv2
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.utils import ImageReader
-from reportlab.pdfgen import canvas
-import folium
+from PIL import Image, ImageChops
+import tempfile
+import logging
+from collections import deque
+from datetime import datetime
+from PIL.ExifTags import TAGS
+import pyexiv2
+import io
+import math
+import torch
+import torch.nn as nn
+import torchvision.transforms as T
+import timm
+from scipy import fftpack
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+import joblib
 
-def desktop_report_folder():
-    p = Path.home() / "Desktop" / "PicForensics_Report"
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def safe_save_image(img_pil, path, quality=90):
-    img_pil.save(path, "JPEG", quality=quality)
 
-def ensure_bytes_to_str(value):
-    if isinstance(value, bytes):
-        try:
-            return value.decode(errors='ignore')
-        except:
-            return str(value)
-    return str(value)
-
-def extract_exif_dict(img_path):
+def compute_ela(image_path, q=90):
     try:
-        exif = piexif.load(img_path)
-    except Exception:
-        return {}
-    readable = {}
-    for ifd in exif:
-        try:
-            for tag, val in exif[ifd].items():
-                tagname = piexif.TAGS.get(ifd, {}).get(tag, {}).get("name", str(tag))
-                readable[f"{ifd}:{tagname}"] = val
-        except Exception:
-            continue
-    return readable
-
-def get_common_exif_fields(exif_dict):
-    def find(name):
-        for k, v in exif_dict.items():
-            if name in k:
-                return ensure_bytes_to_str(v)
+        orig = Image.open(image_path).convert('RGB')
+        buffer = io.BytesIO()
+        orig.save(buffer, "JPEG", quality=q)
+        buffer.seek(0)
+        recompressed = Image.open(buffer)
+        diff = ImageChops.difference(orig, recompressed)
+        extrema = diff.getextrema()
+        max_diff = max([e[1] for e in extrema]) or 1
+        scale = 255.0 / max_diff
+        ela_img = ImageEnhance.Brightness(diff).enhance(scale)
+        return ela_img
+    except Exception as e:
+        logger.error(f"ELA computation failed: {e}")
         return None
-    dt_original = find("DateTimeOriginal")
-    dt = find("DateTime")
-    make = find("Make")
-    model = find("Model")
-    width = find("ImageWidth") or find("PixelXDimension")
-    height = find("ImageLength") or find("PixelYDimension")
-    gps_lat = exif_dict.get("GPS:GPSLatitude")
-    gps_lat_ref = exif_dict.get("GPS:GPSLatitudeRef")
-    gps_lon = exif_dict.get("GPS:GPSLongitude")
-    gps_lon_ref = exif_dict.get("GPS:GPSLongitudeRef")
-    gps = None
-    if gps_lat and gps_lon and gps_lat_ref and gps_lon_ref:
-        try:
-            lat = dms_to_deg(gps_lat)
-            if ensure_bytes_to_str(gps_lat_ref).upper().startswith("S"):
-                lat = -lat
-            lon = dms_to_deg(gps_lon)
-            if ensure_bytes_to_str(gps_lon_ref).upper().startswith("W"):
-                lon = -lon
-            gps = (lat, lon)
-        except Exception:
-            gps = None
-    return {
-        "DateTimeOriginal": dt_original,
-        "DateTime": dt,
-        "Make": make,
-        "Model": model,
-        "Dimensions": f"{width}x{height}" if width and height else None,
-        "GPS": gps
-    }
 
-def dms_to_deg(dms):
+
+def extract_noise(image_path):
     try:
-        d = dms[0][0] / dms[0][1]
-        m = dms[1][0] / dms[1][1]
-        s = dms[2][0] / dms[2][1]
-        return d + m/60.0 + s/3600.0
-    except Exception:
-        raise
+        img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        if img is None:
+            return np.zeros((100, 100), dtype=np.float32)
+        img_f = np.float32(img) / 255.0
+        d = cv2.fastNlMeansDenoisingColored(img.astype(np.uint8), None, 10, 10, 7, 21)
+        d_f = np.float32(d) / 255.0
+        residual = img_f - d_f
+        g = cv2.cvtColor((residual * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
+        return (g - g.mean()) / (g.std() + 1e-8)
+    except Exception as e:
+        logger.error(f"Noise extraction failed: {e}")
+        return np.zeros((100, 100), dtype=np.float32)
 
-def perform_ela_pil(img_path, quality=90):
-    orig = Image.open(img_path).convert("RGB")
-    temp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-    temp.close()
-    orig.save(temp.name, "JPEG", quality=quality)
-    resaved = Image.open(temp.name).convert("RGB")
-    ela = ImageChops.difference(orig, resaved)
-    arr = np.array(ela).astype(np.int32)
-    arr = np.clip(arr * 10, 0, 255).astype(np.uint8)
-    ela_img = Image.fromarray(arr)
-    os.unlink(temp.name)
-    return ela_img
 
-def noise_residual(img_path):
-    img = cv2.imdecode(np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_COLOR)
-    if img is None:
-        raise RuntimeError("Cannot read image for noise residual")
-    img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    den = cv2.fastNlMeansDenoising(img_gray, None, h=10, templateWindowSize=7, searchWindowSize=21)
-    resid = cv2.subtract(img_gray, den)
-    resid_norm = cv2.normalize(resid, None, 0, 255, cv2.NORM_MINMAX)
-    resid_color = cv2.applyColorMap(resid_norm, cv2.COLORMAP_JET)
-    pil = Image.fromarray(cv2.cvtColor(resid_color, cv2.COLOR_BGR2RGB))
-    return pil
-
-def image_histogram_pil(img_path):
-    img = Image.open(img_path).convert("RGB")
-    plt.figure(figsize=(4,2.5))
-    colors = ('r','g','b')
-    for i, col in enumerate(colors):
-        hist = img.getchannel(i).histogram()
-        plt.plot(hist, color=col)
-    plt.tight_layout()
-    buf = io.BytesIO()
-    plt.savefig(buf, format='PNG')
-    plt.close()
-    buf.seek(0)
-    return Image.open(buf)
-
-def produce_timeline_plot(exif_dict):
-    dates = []
-    labels = []
-    d_orig = None
-    d_mod = None
-    for k, v in exif_dict.items():
-        if "DateTimeOriginal" in k and v:
-            try:
-                d_orig = parse_exif_date(ensure_bytes_to_str(v))
-            except:
-                pass
-        if "DateTime" in k and v:
-            try:
-                d_mod = parse_exif_date(ensure_bytes_to_str(v))
-            except:
-                pass
-    if not d_orig and not d_mod:
-        plt.figure(figsize=(4,1.4))
-        plt.text(0.1, 0.5, "No timestamps available", fontsize=10)
-        plt.axis('off')
-        buf = io.BytesIO()
-        plt.savefig(buf, format='PNG', bbox_inches='tight')
-        plt.close()
-        buf.seek(0)
-        return Image.open(buf)
-    x = []
-    y = []
-    ticks = []
-    if d_orig:
-        x.append(d_orig)
-        y.append(1)
-        ticks.append(("Original", d_orig))
-    if d_mod:
-        x.append(d_mod)
-        y.append(1)
-        ticks.append(("Modified", d_mod))
-    xs = matplotlib.dates.date2num(x)
-    plt.figure(figsize=(4,1.4))
-    plt.hlines(1, xs.min()-0.1, xs.max()+0.1)
-    plt.scatter(xs, y)
-    for i, (lab, dt) in enumerate(ticks):
-        plt.text(xs[i], 1.05, f"{lab}\n{dt.strftime('%Y-%m-%d %H:%M')}", ha='center', fontsize=8)
-    plt.gca().yaxis.set_visible(False)
-    plt.gca().xaxis.set_visible(False)
-    plt.tight_layout()
-    buf = io.BytesIO()
-    plt.savefig(buf, format='PNG', bbox_inches='tight')
-    plt.close()
-    buf.seek(0)
-    return Image.open(buf)
-
-def parse_exif_date(s):
+def fft_features(image_path):
     try:
-        return datetime.datetime.strptime(s.strip(), "%Y:%m:%d %H:%M:%S")
-    except:
+        img = Image.open(image_path).convert("L")
+        arr = np.asarray(img).astype(np.float32)
+        F = fftpack.fftshift(fftpack.fft2(arr))
+        mag = np.log1p(np.abs(F))
+        return mag.std()
+    except Exception as e:
+        logger.error(f"FFT features failed: {e}")
+        return 0.0
+
+
+class Embedding:
+    def __init__(self, name, device, size=224):
         try:
-            return datetime.datetime.strptime(s.strip(), "%Y:%m:%d")
+            self.model = timm.create_model(name, pretrained=True, num_classes=0, global_pool="avg").to(device)
+            self.model.eval()
+            self.device = device
+            self.tf = T.Compose([
+                T.Resize((size, size)),
+                T.ToTensor(),
+                T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+            ])
+        except Exception as e:
+            logger.error(f"Embedding model {name} failed: {e}")
+            self.model = None
+
+    def extract(self, img):
+        if self.model is None:
+            return np.zeros(1000, dtype=np.float32)
+        try:
+            t = self.tf(img).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                feat = self.model(t).cpu().numpy().flatten()
+            return feat
+        except Exception as e:
+            logger.error(f"Feature extraction failed: {e}")
+            return np.zeros(1000, dtype=np.float32)
+
+
+class SmallNoiseCNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(1, 16, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(64, 128)
+        )
+
+    def forward(self, x): return self.net(x)
+
+
+class CombinedAIDetectorMinimal:
+    def __init__(self, device="cpu"):
+        self.device = device
+        self.effnet = Embedding("efficientnet_b0", device)
+        self.vit = Embedding("vit_base_patch16_224", device)
+        self.noise_model = SmallNoiseCNN().to(device)
+        self.noise_model.eval()
+        self.scaler = StandardScaler()
+        self.clf = LogisticRegression()
+        self._initialize_fallback_model()
+
+    def _initialize_fallback_model(self):
+        self.fallback_weights = {
+            'noise_std': 0.3,
+            'fft_features': 0.3,
+            'file_characteristics': 0.4
+        }
+
+    def extract_features(self, path):
+        try:
+            img = Image.open(path).convert("RGB")
+            f1 = self.effnet.extract(img)
+            f2 = self.vit.extract(img)
+            ela_img = compute_ela(path)
+            f3 = self.effnet.extract(ela_img) if ela_img else np.zeros(1000)
+            noise = extract_noise(path)
+            noise_r = cv2.resize(noise, (128, 128))
+            t = torch.from_numpy(noise_r).float().unsqueeze(0).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                f4 = self.noise_model(t).cpu().numpy().flatten()
+            fft_std = fft_features(path)
+            f5 = np.array([fft_std], dtype=np.float32)
+            return np.concatenate([f1, f2, f3, f4, f5])
+        except Exception as e:
+            logger.error(f"Feature extraction failed: {e}")
+            return self._extract_fallback_features(path)
+
+    def _extract_fallback_features(self, path):
+        try:
+            noise = extract_noise(path)
+            fft_std = fft_features(path)
+            img = Image.open(path)
+            file_size = os.path.getsize(path) / (1024 * 1024)
+            mp_ratio = (img.width * img.height) / (file_size * 1000000) if file_size > 0 else 0
+            return np.array([noise.std(), fft_std, mp_ratio], dtype=np.float32)
         except:
-            raise
+            return np.array([0.5, 0.5, 0.5], dtype=np.float32)
 
-def generate_warnings(exif_common, file_info):
-    warnings = []
-    dt_orig = exif_common.get("DateTimeOriginal")
-    dt_mod = exif_common.get("DateTime")
-    gps = exif_common.get("GPS")
-    if dt_orig and dt_mod:
+    def analyze(self, path):
         try:
-            d1 = parse_exif_date(dt_orig) if isinstance(dt_orig, str) else parse_exif_date(ensure_bytes_to_str(dt_orig))
-            d2 = parse_exif_date(dt_mod) if isinstance(dt_mod, str) else parse_exif_date(ensure_bytes_to_str(dt_mod))
-            if d2 < d1:
-                warnings.append("Modification timestamp is earlier than creation timestamp.")
-        except Exception:
-            warnings.append("Timestamp parsing issue.")
-    if not dt_orig and dt_mod:
-        warnings.append("DateTimeOriginal missing; only Modify date present.")
-    if not dt_orig and not dt_mod:
-        warnings.append("No EXIF timestamps found.")
-    if gps:
-        lat, lon = gps
-        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-            warnings.append("GPS coordinates out of range.")
-    else:
-        warnings.append("No GPS coordinates found in EXIF.")
-    size_mb = file_info.get("size_mb", 0)
-    dims = file_info.get("dimensions")
-    if dims:
+            feats = self.extract_features(path).reshape(1, -1)
+            if hasattr(self.scaler, 'mean_') and hasattr(self.clf, 'classes_'):
+                feats_s = self.scaler.transform(feats)
+                p = float(self.clf.predict_proba(feats_s)[0, 1])
+            else:
+                p = self._fallback_analysis(path)
+        except Exception as e:
+            logger.error(f"Analysis failed: {e}")
+            p = self._fallback_analysis(path)
+
+        conf = (
+            "VERY HIGH" if p > 0.90 else
+            "HIGH" if p > 0.75 else
+            "MEDIUM" if p > 0.50 else
+            "LOW" if p > 0.25 else
+            "VERY LOW"
+        )
+
+        return {"ai_probability": round(p, 4), "confidence": conf}
+
+    def _fallback_analysis(self, path):
         try:
-            w, h = dims
-            mega_pixels = (w * h) / 1e6
-            if mega_pixels > 6 and size_mb < 0.2:
-                warnings.append("High-resolution image with very small file size (possible aggressive recompression).")
+            noise = extract_noise(path)
+            fft_std = fft_features(path)
+            img = Image.open(path)
+            file_size = os.path.getsize(path) / (1024 * 1024)
+            score = 0.0
+            score += (1.0 - min(noise.std() / 10.0, 1.0)) * self.fallback_weights['noise_std']
+            score += min(fft_std / 50.0, 1.0) * self.fallback_weights['fft_features']
+            if file_size > 0 and (img.width * img.height) / (file_size * 1000000) > 10:
+                score += 0.3 * self.fallback_weights['file_characteristics']
+            return min(score, 1.0)
+        except:
+            return 0.5
+
+
+class AdvancedImageTimelineAnalyzer:
+    def __init__(self):
+        self.date_format = "%Y:%m:%d %H:%M:%S"
+
+    class ImageAnalysisResult:
+        def __init__(self, file_name):
+            self.file_name = file_name
+            self.date_time_results = {}
+            self.file_system_dates = {}
+            self.exif_dates = {}
+            self.best_guess_date = ""
+            self.camera_info = {}
+            self.gps_info = {}
+
+        def get_file_name(self):
+            return self.file_name
+
+        def get_date_time_results(self):
+            return self.date_time_results
+
+        def get_file_system_dates(self):
+            return self.file_system_dates
+
+        def get_exif_dates(self):
+            return self.exif_dates
+
+        def get_best_guess_date(self):
+            return self.best_guess_date
+
+        def set_best_guess_date(self, best_guess_date):
+            self.best_guess_date = best_guess_date
+
+    def analyze_image(self, image_path):
+        result = self.ImageAnalysisResult(os.path.basename(image_path))
+        try:
+            self.analyze_file_system_dates(image_path, result)
+            self.analyze_exif_metadata(image_path, result)
+            self.analyze_camera_info(image_path, result)
+            self.analyze_gps_info(image_path, result)
+            self.determine_best_guess_date(result)
+            self.compile_all_results(result)
+        except Exception as e:
+            result.date_time_results["ERROR"] = f"Failed to analyze image: {str(e)}"
+        return result
+
+    def analyze_file_system_dates(self, image_path, result):
+        try:
+            stat_info = os.stat(image_path)
+            creation_time = datetime.fromtimestamp(stat_info.st_ctime)
+            modified_time = datetime.fromtimestamp(stat_info.st_mtime)
+            access_time = datetime.fromtimestamp(stat_info.st_atime)
+            result.file_system_dates["FileCreationTime"] = creation_time.strftime(self.date_format)
+            result.file_system_dates["FileModifiedTime"] = modified_time.strftime(self.date_format)
+            result.file_system_dates["FileAccessTime"] = access_time.strftime(self.date_format)
+        except Exception as e:
+            result.file_system_dates["ERROR"] = "File system analysis failed"
+
+    def analyze_exif_metadata(self, image_path, result):
+        try:
+            self.extract_exif_with_pil(image_path, result)
+            self.extract_exif_with_pyexiv2(image_path, result)
+        except Exception as e:
+            result.exif_dates["ERROR"] = "EXIF metadata analysis failed"
+
+    def analyze_camera_info(self, image_path, result):
+        try:
+            with pyexiv2.Image(image_path) as img:
+                exif_data = img.read_exif()
+                camera_tags = {
+                    'Exif.Image.Make': 'Camera Make',
+                    'Exif.Image.Model': 'Camera Model',
+                    'Exif.Photo.FNumber': 'Aperture',
+                    'Exif.Photo.ExposureTime': 'Exposure Time',
+                    'Exif.Photo.ISOSpeedRatings': 'ISO',
+                    'Exif.Photo.FocalLength': 'Focal Length'
+                }
+                for exif_tag, friendly_name in camera_tags.items():
+                    if exif_tag in exif_data:
+                        result.camera_info[friendly_name] = exif_data[exif_tag]
         except:
             pass
-    return warnings
 
-class ToolTip(object):
-    def __init__(self, widget, text):
-        self.widget = widget
-        self.text = text
-        self.tipwin = None
-        widget.bind("<Enter>", self.show)
-        widget.bind("<Leave>", self.hide)
+    def analyze_gps_info(self, image_path, result):
+        try:
+            with pyexiv2.Image(image_path) as img:
+                exif_data = img.read_exif()
+                gps_tags = {
+                    'Exif.GPSInfo.GPSLatitude': 'Latitude',
+                    'Exif.GPSInfo.GPSLongitude': 'Longitude',
+                    'Exif.GPSInfo.GPSAltitude': 'Altitude'
+                }
+                for exif_tag, friendly_name in gps_tags.items():
+                    if exif_tag in exif_data:
+                        result.gps_info[friendly_name] = exif_data[exif_tag]
+        except:
+            pass
 
-    def show(self, _=None):
-        if self.tipwin or not self.text:
-            return
-        x = self.widget.winfo_rootx() + 20
-        y = self.widget.winfo_rooty() + 20
-        self.tipwin = tw = Toplevel(self.widget)
-        tw.wm_overrideredirect(True)
-        tw.wm_geometry("+%d+%d" % (x, y))
-        label = Label(tw, text=self.text, justify='left', background="#ffffe0", relief='solid', borderwidth=1, font=("tahoma", "8", "normal"))
-        label.pack(ipadx=1)
+    def extract_exif_with_pil(self, image_path, result):
+        try:
+            with Image.open(image_path) as img:
+                exif_data = img._getexif()
+                if exif_data:
+                    for tag_id, value in exif_data.items():
+                        tag_name = TAGS.get(tag_id, tag_id)
+                        if "date" in tag_name.lower() or "time" in tag_name.lower():
+                            try:
+                                if isinstance(value, str):
+                                    result.exif_dates[tag_name] = value
+                            except:
+                                pass
+        except:
+            pass
 
-    def hide(self, _=None):
-        if self.tipwin:
-            self.tipwin.destroy()
-            self.tipwin = None
+    def extract_exif_with_pyexiv2(self, image_path, result):
+        try:
+            with pyexiv2.Image(image_path) as img:
+                exif_data = img.read_exif()
+                date_tags = {
+                    'Exif.Photo.DateTimeOriginal': 'DateTimeOriginal',
+                    'Exif.Photo.DateTimeDigitized': 'DateTimeDigitized',
+                    'Exif.Image.DateTime': 'DateTime',
+                    'Exif.Image.ModifyDate': 'ModifyDate'
+                }
+                for exif_tag, friendly_name in date_tags.items():
+                    if exif_tag in exif_data:
+                        result.exif_dates[friendly_name] = exif_data[exif_tag]
+        except:
+            pass
+
+    def determine_best_guess_date(self, result):
+        priority_order = [
+            "DateTimeOriginal",
+            "DateTimeDigitized",
+            "DateTime",
+            "ModifyDate",
+            "FileCreationTime",
+            "FileModifiedTime"
+        ]
+        for date_type in priority_order:
+            date_value = self.find_date_in_sources(date_type, result)
+            if date_value:
+                result.set_best_guess_date(f"{date_value} ({date_type})")
+                return
+        result.set_best_guess_date("No reliable date found")
+
+    def find_date_in_sources(self, date_type, result):
+        if date_type in result.exif_dates:
+            return result.exif_dates[date_type]
+        if date_type in result.file_system_dates:
+            return result.file_system_dates[date_type]
+        return None
+
+    def compile_all_results(self, result):
+        result.date_time_results["=== COMPREHENSIVE ANALYSIS ==="] = ""
+        result.date_time_results["--- EXIF METADATA DATES ---"] = ""
+        if not result.exif_dates:
+            result.date_time_results["No EXIF dates found"] = ""
+        else:
+            for key, value in result.exif_dates.items():
+                result.date_time_results[f"{key}:"] = value
+        result.date_time_results["--- FILE SYSTEM DATES ---"] = ""
+        for key, value in result.file_system_dates.items():
+            result.date_time_results[f"{key}:"] = value
+        result.date_time_results["--- CAMERA INFORMATION ---"] = ""
+        if not result.camera_info:
+            result.date_time_results["No camera info found"] = ""
+        else:
+            for key, value in result.camera_info.items():
+                result.date_time_results[f"{key}:"] = value
+        result.date_time_results["--- GPS INFORMATION ---"] = ""
+        if not result.gps_info:
+            result.date_time_results["No GPS info found"] = ""
+        else:
+            for key, value in result.gps_info.items():
+                result.date_time_results[f"{key}:"] = value
+        result.date_time_results["--- BEST GUESS DATE ---"] = ""
+        result.date_time_results["Most reliable date:"] = result.best_guess_date
+
 
 class PicForensicsApp:
-    def __init__(self, master):
-        self.master = master
-        master.title("PicForensics")
-        master.geometry("1100x700")
-        self.theme = StringVar(value="light")
-        self.create_menu()
-        self.left_frame = Frame(master, width=700, relief="sunken", bd=1)
-        self.left_frame.pack(side=LEFT, fill=BOTH, expand=True, padx=6, pady=6)
+    def __init__(self, root):
+        self.root = root
+        self.root.title("PicForensics Professional")
+        self.root.geometry("800x600")
+        self.root.configure(bg="#e3f2fd")
 
-        self.right_frame = Frame(master, width=380, relief="sunken", bd=1)
-        self.right_frame.pack(side=RIGHT, fill=Y, padx=6, pady=6)
+        self.current_image = None
+        self.image_label = None
+        self.uploaded_images = []
+        self.current_image_index = -1
+        self.ai_detector = CombinedAIDetectorMinimal()
+        self.timeline_analyzer = AdvancedImageTimelineAnalyzer()
 
-        toolbar = Frame(self.left_frame)
-        toolbar.pack(side=TOP, fill=X, padx=4, pady=4)
-        btn_upload = Button(toolbar, text="Upload", bg="#2ecc71", command=self.upload_image)
-        btn_ela = Button(toolbar, text="ELA", bg="#3498db", command=self.show_ela_view)
-        btn_noise = Button(toolbar, text="Noise", bg="#e67e22", command=self.show_noise_view)
-        btn_pixel = Button(toolbar, text="Pixel", bg="#9b59b6", command=self.show_original_view)
-        btn_hist = Button(toolbar, text="Histogram", bg="#95a5a6", command=self.show_hist_view)
-        btn_save = Button(toolbar, text="Save Report", bg="#34495e", fg="white", command=self.generate_report)
-        btn_upload.pack(side=LEFT, padx=3); ToolTip(btn_upload, "Open image file(s) from disk (single or batch).")
-        btn_ela.pack(side=LEFT, padx=3); ToolTip(btn_ela, "Show Error Level Analysis (ELA) view.")
-        btn_noise.pack(side=LEFT, padx=3); ToolTip(btn_noise, "Show Noise Residual analysis (approx PRNU).")
-        btn_pixel.pack(side=LEFT, padx=3); ToolTip(btn_pixel, "Show original image pixel view.")
-        btn_hist.pack(side=LEFT, padx=3); ToolTip(btn_hist, "Show RGB histogram.")
-        btn_save.pack(side=LEFT, padx=3); ToolTip(btn_save, "Generate and save a PDF report to Desktop/PicForensics_Report/")
+        self.create_widgets()
 
-        self.preview_label = Label(self.left_frame, text="Upload Image Here", bg="#dfe6e9", width=80, height=20, anchor="center")
-        self.preview_label.pack(fill=BOTH, expand=True, padx=6, pady=6)
+    def create_widgets(self):
+        nav_frame = tk.Frame(self.root, bg="#1976d2", height=40)
+        nav_frame.pack(fill=tk.X, padx=10, pady=5)
+        nav_frame.pack_propagate(False)
 
-        self.status_label = Label(self.left_frame, text="Ready", anchor="w")
-        self.status_label.pack(side=BOTTOM, fill=X)
+        nav_items = ["HOME", "About", "Help", "Exit"]
+        for item in nav_items:
+            btn = tk.Button(nav_frame, text=item, relief=tk.FLAT, bg="#1976d2",
+                            fg="white", font=("Arial", 9),
+                            command=lambda i=item: self.nav_action(i))
+            btn.pack(side=tk.LEFT, padx=10)
 
-        self.file_info_box = Text(self.right_frame, height=6, width=46)
-        self.file_info_box.pack(padx=6, pady=6)
-        self.file_info_box.config(state='disabled')
+        separator = ttk.Separator(self.root, orient=tk.HORIZONTAL)
+        separator.pack(fill=tk.X, padx=10, pady=5)
 
-        lbl_meta = Label(self.right_frame, text="Metadata & Geo Tags", font=("Arial", 10, "bold"))
-        lbl_meta.pack(anchor=NW, padx=6)
-        self.meta_box = Text(self.right_frame, height=10, width=46)
-        self.meta_box.pack(padx=6, pady=4)
-        self.meta_box.config(state='disabled')
+        main_content = tk.Frame(self.root, bg="#e3f2fd")
+        main_content.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        lbl_results = Label(self.right_frame, text="Analysis Results", font=("Arial", 10, "bold"))
-        lbl_results.pack(anchor=NW, padx=6)
-        self.results_box = Text(self.right_frame, height=6, width=46)
-        self.results_box.pack(padx=6, pady=4)
-        self.results_box.config(state='disabled')
+        content_row = tk.Frame(main_content, bg="#e3f2fd")
+        content_row.pack(fill=tk.BOTH, expand=True)
 
-        lbl_timeline = Label(self.right_frame, text="Timeline", font=("Arial", 10, "bold"))
-        lbl_timeline.pack(anchor=NW, padx=6)
-        self.timeline_label = Label(self.right_frame, text="No timeline yet", width=40, height=4, bg="#ecf0f1")
-        self.timeline_label.pack(padx=6, pady=4)
+        left_frame = tk.Frame(content_row, bg="#e3f2fd")
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        self.warning_label = Label(master, text="", bg="#ffdddd", fg="darkred", font=("Arial", 10, "bold"))
-        self.warning_label.pack(side=BOTTOM, fill=X, padx=6, pady=(0,6))
+        self.image_frame = tk.Frame(left_frame, width=400, height=300, relief=tk.RAISED,
+                                    bd=2, bg='white')
+        self.image_frame.pack(pady=10)
+        self.image_frame.pack_propagate(False)
 
-        self.current_image_path = None
-        self.current_image_pil = None
-        self.current_views = {}
+        self.image_placeholder = tk.Label(self.image_frame,
+                                          text="No Image Loaded\nClick 'Open New Image' to load an image",
+                                          fg="gray", font=("Arial", 10), bg='white')
+        self.image_placeholder.pack(expand=True)
 
-        theme_btn = Button(self.right_frame, text="Toggle Theme", command=self.toggle_theme)
-        theme_btn.pack(pady=6)
+        self.navigation_frame = tk.Frame(left_frame, bg="#e3f2fd")
+        self.navigation_frame.pack(fill=tk.X, pady=5)
 
-        self.batch_list = []
-        self.current_batch_index = 0
+        self.prev_btn = tk.Button(self.navigation_frame, text="◀ Previous", command=self.previous_image,
+                                  state="disabled", bg="#2196f3", fg="white", font=("Arial", 9))
+        self.prev_btn.pack(side=tk.LEFT, padx=5)
 
-    def create_menu(self):
-        menubar = Menu(self.master)
-        file_menu = Menu(menubar, tearoff=0)
-        file_menu.add_command(label="Open Image(s)...", command=self.upload_image)
-        file_menu.add_command(label="Save Report (PDF)", command=self.generate_report)
-        file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.master.quit)
-        menubar.add_cascade(label="File", menu=file_menu)
+        self.next_btn = tk.Button(self.navigation_frame, text="Next ▶", command=self.next_image,
+                                  state="disabled", bg="#2196f3", fg="white", font=("Arial", 9))
+        self.next_btn.pack(side=tk.LEFT, padx=5)
 
-        analysis_menu = Menu(menubar, tearoff=0)
-        analysis_menu.add_command(label="Run Integrity Check", command=self.check_integrity)
-        analysis_menu.add_command(label="Show ELA", command=self.show_ela_view)
-        analysis_menu.add_command(label="Show Noise Residual", command=self.show_noise_view)
-        menubar.add_cascade(label="Analysis", menu=analysis_menu)
+        self.verify_btn = tk.Button(self.navigation_frame, text="Verify Integrity", command=self.verify_integrity,
+                                    state="disabled", bg="#ff9800", fg="white", font=("Arial", 9))
+        self.verify_btn.pack(side=tk.LEFT, padx=5)
 
-        view_menu = Menu(menubar, tearoff=0)
-        view_menu.add_command(label="Show Original", command=self.show_original_view)
-        view_menu.add_command(label="Show Histogram", command=self.show_hist_view)
-        menubar.add_cascade(label="View", menu=view_menu)
+        self.image_counter = tk.Label(self.navigation_frame, text="No images", bg="#e3f2fd", font=("Arial", 9))
+        self.image_counter.pack(side=tk.LEFT, padx=10)
 
-        help_menu = Menu(menubar, tearoff=0)
-        help_menu.add_command(label="About", command=lambda: messagebox.showinfo("About", "PicForensics \nEXIF, ELA, Noise, Timeline, Report"))
-        help_menu.add_command(label="Help/Manual", command=self.show_help_window)
-        menubar.add_cascade(label="Help", menu=help_menu)
+        self.info_frame = tk.LabelFrame(left_frame, text="Image Info", padx=10, pady=10,
+                                        bg="#e3f2fd", fg="#1976d2", font=("Arial", 10, "bold"))
+        self.info_frame.pack(fill=tk.X, pady=(10, 0))
 
-        self.master.config(menu=menubar)
+        self.info_data = {
+            "File Size": "No image loaded",
+            "File Format": "No image loaded",
+            "File Path": "No image loaded"
+        }
 
-    def toggle_theme(self):
-        if self.theme.get() == "light":
-            self.theme.set("dark")
-            self.master.configure(bg="#2c3e50")
-            self.preview_label.configure(bg="#34495e", fg="white")
-            self.status_label.configure(bg="#2c3e50", fg="white")
-        else:
-            self.theme.set("light")
-            self.master.configure(bg="SystemButtonFace")
-            self.preview_label.configure(bg="#dfe6e9", fg="black")
-            self.status_label.configure(bg=self.master.cget("bg"), fg="black")
+        self.info_labels = {}
+        row = 0
+        for key, value in self.info_data.items():
+            tk.Label(self.info_frame, text=f"{key}:", font=("Arial", 9, "bold"),
+                     bg="#e3f2fd", fg="#1976d2").grid(row=row, column=0, sticky=tk.W, pady=1)
+            value_label = tk.Label(self.info_frame, text=value, font=("Arial", 9),
+                                   bg="#e3f2fd")
+            value_label.grid(row=row, column=1, sticky=tk.W, pady=1)
+            self.info_labels[key] = value_label
+            row += 1
 
-    def show_help_window(self):
-        text = (
-            "PicForensics Help\n\n"
-            "1. Open Image(s): Select single or multiple images to analyze.\n"
-            "2. Use toolbar to view Original, ELA, Noise, Histogram.\n"
-            "3. Run 'Run Integrity Check' for automated checks and warnings.\n"
-            "4. Generate Report saves PDF and copies image(s) to Desktop/PicForensics_Report.\n"
-            "Notes: Noise Residual is an approximation. True PRNU requires camera references."
-        )
-        messagebox.showinfo("Help / Manual", text)
+        tools_frame = tk.Frame(content_row, width=200, bg="#e3f2fd")
+        tools_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(20, 0))
+        tools_frame.pack_propagate(False)
 
-    def upload_image(self):
-        paths = filedialog.askopenfilenames(filetypes=[("Image files","*.jpg;*.jpeg;*.png;*.tif;*.tiff")])
-        if not paths:
+        self.analysis_var = tk.StringVar(value="Analysis Results ▼")
+        analysis_menu = tk.Menubutton(tools_frame, textvariable=self.analysis_var,
+                                      relief=tk.RAISED, width=18, height=1,
+                                      font=("Arial", 10), bg="#2196f3", fg="white")
+        analysis_menu.pack(pady=5, fill=tk.X)
+
+        analysis_dropdown = tk.Menu(analysis_menu, tearoff=0)
+        analysis_dropdown.add_command(label="Meta Data", command=self.meta_data_analysis)
+        analysis_dropdown.add_command(label="Time line", command=self.timeline_analysis)
+        analysis_dropdown.add_command(label="AI detection", command=self.ai_detection_analysis)
+
+        analysis_menu.configure(menu=analysis_dropdown)
+
+        self.tools_var = tk.StringVar(value="Analysis Tools ▼")
+        tools_menu = tk.Menubutton(tools_frame, textvariable=self.tools_var,
+                                   relief=tk.RAISED, width=18, height=1,
+                                   font=("Arial", 10), bg="#2196f3", fg="white")
+        tools_menu.pack(pady=5, fill=tk.X)
+
+        tools_dropdown = tk.Menu(tools_menu, tearoff=0)
+        tools_dropdown.add_command(label="ELA", command=self.ela_analysis)
+        tools_dropdown.add_command(label="Noise", command=self.noise_analysis)
+        tools_dropdown.add_command(label="Histogram", command=self.histogram_analysis)
+
+        tools_menu.configure(menu=tools_dropdown)
+
+        spacer = tk.Frame(tools_frame, height=20, bg="#e3f2fd")
+        spacer.pack(fill=tk.X)
+
+        img_btn_frame = tk.Frame(main_content, bg="#e3f2fd")
+        img_btn_frame.pack(pady=10)
+
+        open_btn = tk.Button(img_btn_frame, text="Open New Image", command=self.open_image,
+                             bg="#2196f3", fg="white", font=("Arial", 10),
+                             relief=tk.RAISED, bd=2)
+        open_btn.pack(side=tk.LEFT, padx=5)
+
+        delete_btn = tk.Button(img_btn_frame, text="Delete Image", command=self.delete_image,
+                               bg="#2196f3", fg="white", font=("Arial", 10),
+                               relief=tk.RAISED, bd=2)
+        delete_btn.pack(side=tk.LEFT, padx=5)
+
+    def nav_action(self, item):
+        if item == "Exit":
+            self.root.quit()
+        elif item == "HOME":
+            self.show_home_dashboard()
+        elif item == "About":
+            self.show_about_info()
+        elif item == "Help":
+            self.show_help_info()
+
+    def show_home_dashboard(self):
+        home_window = tk.Toplevel(self.root)
+        home_window.title("PicForensics - Dashboard")
+        home_window.geometry("600x400")
+        home_window.configure(bg="#f5f5f5")
+
+        header = tk.Label(home_window, text="📷 PicForensics Professional",
+                          font=("Arial", 16, "bold"), bg="#f5f5f5", fg="#1976d2")
+        header.pack(pady=20)
+
+        stats_frame = tk.Frame(home_window, bg="#f5f5f5")
+        stats_frame.pack(pady=10)
+
+        stats = [
+            f"📁 Loaded Images: {len(self.uploaded_images)}",
+            f"🔍 Current Analysis: {os.path.basename(self.current_image) if self.current_image else 'None'}",
+            f"🛠️ Tools Available: 6 Analysis Methods",
+            f"📊 Last Result: {getattr(self, 'last_ai_result', 'No analysis yet')}"
+        ]
+
+        for stat in stats:
+            lbl = tk.Label(stats_frame, text=stat, font=("Arial", 11),
+                           bg="#f5f5f5", fg="#333")
+            lbl.pack(pady=5)
+
+        quick_actions = tk.Frame(home_window, bg="#f5f5f5")
+        quick_actions.pack(pady=20)
+
+        action_btn = tk.Button(quick_actions, text="Quick Integrity Check",
+                               command=self.quick_integrity_check,
+                               bg="#4caf50", fg="white", font=("Arial", 10))
+        action_btn.pack(side=tk.LEFT, padx=10)
+
+        close_btn = tk.Button(home_window, text="Close Dashboard",
+                              command=home_window.destroy,
+                              bg="#2196f3", fg="white", font=("Arial", 10))
+        close_btn.pack(pady=10)
+
+    def quick_integrity_check(self):
+        if not self.current_image:
+            messagebox.showwarning("No Image", "Please load an image first!")
             return
-        self.batch_list = list(paths)
-        self.current_batch_index = 0
-        self.load_current_batch_image()
 
-    def load_current_batch_image(self):
-        if not self.batch_list:
-            return
-        path = self.batch_list[self.current_batch_index]
-        self.load_image(path)
-
-    def load_image(self, path):
         try:
-            pil = Image.open(path).convert("RGB")
+            result = self.ai_detector.analyze(self.current_image)
+            messagebox.showinfo("Quick Integrity Check",
+                                f"AI Probability: {result['ai_probability']}\n"
+                                f"Confidence: {result['confidence']}")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to open image: {e}")
+            messagebox.showerror("Error", f"Quick check failed: {str(e)}")
+
+    def show_about_info(self):
+        about_text = """PicForensics Professional
+
+Version: 3.0 Enhanced
+Advanced Image Forensics Tool
+
+Features:
+• Combined AI Detection with Multiple Models
+• Comprehensive Metadata Analysis
+• Advanced Timeline Reconstruction
+• Professional Integrity Verification
+
+Technology Stack:
+• PyTorch & EfficientNet Models
+• OpenCV Image Processing
+• Advanced EXIF Analysis
+• Machine Learning Ensemble"""
+        messagebox.showinfo("About PicForensics", about_text)
+
+    def show_help_info(self):
+        help_text = """PicForensics Help Guide
+
+Basic Operations:
+• Open New Image: Load single or multiple images
+• Navigation: Use Previous/Next buttons
+• Verify Integrity: Comprehensive authenticity check
+
+Analysis Tools:
+• ELA: Error Level Analysis
+• Noise: Pattern analysis
+• Histogram: Color distribution
+
+Analysis Results:
+• Meta Data: EXIF and file information
+• Time Line: Creation and modification dates
+• AI Detection: AI-generated image detection
+
+Professional forensic analysis tool"""
+        messagebox.showinfo("Help Guide", help_text)
+
+    def verify_integrity(self):
+        if not self.current_image:
+            messagebox.showwarning("No Image", "Please load an image first!")
             return
-        self.current_image_path = path
-        self.current_image_pil = pil
-        self.current_views['original'] = pil.copy()
-        preview = pil.copy()
-        preview.thumbnail((760, 520))
-        tkimg = ImageTk.PhotoImage(preview)
-        self.preview_label.config(image=tkimg, text="")
-        self.preview_label.image = tkimg
 
-        stat = Path(path).stat()
-        size_mb = stat.st_size / (1024 * 1024)
         try:
-            dims = pil.size
-        except:
-            dims = None
-        self.file_info_box.config(state='normal')
-        self.file_info_box.delete(1.0, "end")
-        self.file_info_box.insert("end", f"File: {os.path.basename(path)}\n")
-        self.file_info_box.insert("end", f"Path: {path}\n")
-        self.file_info_box.insert("end", f"Size: {size_mb:.2f} MB\n")
-        self.file_info_box.insert("end", f"Format: {pil.format}\n")
-        self.file_info_box.insert("end", f"Dimensions: {dims}\n")
-        self.file_info_box.config(state='disabled')
+            integrity_report = "Integrity Verification Report\n\n"
 
-        exif = extract_exif_dict(path)
-        self.meta_box.config(state='normal')
-        self.meta_box.delete(1.0, "end")
-        if exif:
-            common = get_common_exif_fields(exif)
-            self.meta_box.insert("end", f"Make: {common.get('Make')}\n")
-            self.meta_box.insert("end", f"Model: {common.get('Model')}\n")
-            self.meta_box.insert("end", f"DateTimeOriginal: {common.get('DateTimeOriginal')}\n")
-            self.meta_box.insert("end", f"DateTime: {common.get('DateTime')}\n")
-            self.meta_box.insert("end", f"Dimensions: {common.get('Dimensions')}\n")
-            self.meta_box.insert("end", f"GPS: {common.get('GPS')}\n")
+            file_size = os.path.getsize(self.current_image) / (1024 * 1024)
+            integrity_report += f"File Size: {file_size:.2f} MB\n"
+
+            image = Image.open(self.current_image)
+            integrity_report += f"Dimensions: {image.width} x {image.height}\n"
+            integrity_report += f"Format: {image.format}\n\n"
+
+            timeline_result = self.timeline_analyzer.analyze_image(self.current_image)
+            integrity_report += f"Best Guess Date: {timeline_result.best_guess_date}\n\n"
+
+            ai_result = self.ai_detector.analyze(self.current_image)
+            ai_prob = ai_result['ai_probability']
+            confidence = ai_result['confidence']
+
+            integrity_report += f"AI Detection: {ai_prob:.1%}\n"
+            integrity_report += f"Confidence: {confidence}\n\n"
+
+            if ai_prob > 0.7:
+                integrity_report += "WARNING: High probability of AI generation\n"
+            elif ai_prob > 0.5:
+                integrity_report += "NOTE: Possible AI involvement\n"
+            else:
+                integrity_report += "Likely authentic image\n"
+
+            if file_size < 0.1 and image.width * image.height > 1000000:
+                integrity_report += "WARNING: High resolution with small file size\n"
+
+            self.last_ai_result = f"{ai_prob:.1%} ({confidence})"
+            messagebox.showinfo("Integrity Verification", integrity_report)
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Integrity verification failed: {str(e)}")
+
+    def update_navigation_buttons(self):
+        if len(self.uploaded_images) <= 1:
+            self.prev_btn.config(state="disabled")
+            self.next_btn.config(state="disabled")
         else:
-            self.meta_box.insert("end", "No EXIF metadata found.\n")
-        self.meta_box.config(state='disabled')
+            self.prev_btn.config(state="normal")
+            self.next_btn.config(state="normal")
 
-        self.results_box.config(state='normal')
-        self.results_box.delete(1.0, "end")
-        self.results_box.config(state='disabled')
-        self.warning_label.config(text="")
-
-        tl_img = produce_timeline_plot(exif)
-        tl_img.thumbnail((320, 90))
-        tk_tl = ImageTk.PhotoImage(tl_img)
-        self.timeline_label.config(image=tk_tl, text="")
-        self.timeline_label.image = tk_tl
-
-        self.status_label.config(text=f"Loaded: {os.path.basename(path)} ({self.current_batch_index+1}/{len(self.batch_list)})")
-
-    def show_original_view(self):
-        if not self.current_image_pil:
-            return
-        self._show_preview(self.current_views.get('original'))
-
-    def show_ela_view(self):
-        if not self.current_image_path:
-            messagebox.showwarning("No image", "Please open an image first.")
-            return
-        if 'ela' not in self.current_views:
-            self.status_label.config(text="Computing ELA...")
-            ela_img = perform_ela_pil(self.current_image_path)
-            self.current_views['ela'] = ela_img
-            self.status_label.config(text="ELA ready.")
-        self._show_preview(self.current_views['ela'])
-
-    def show_noise_view(self):
-        if not self.current_image_path:
-            messagebox.showwarning("No image", "Please open an image first.")
-            return
-        if 'noise' not in self.current_views:
-            self.status_label.config(text="Computing noise residual...")
-            try:
-                noise_img = noise_residual(self.current_image_path)
-                self.current_views['noise'] = noise_img
-            except Exception as e:
-                messagebox.showerror("Noise Error", f"Noise residual failed: {e}")
-                self.current_views['noise'] = None
-            self.status_label.config(text="Noise ready.")
-        if self.current_views['noise']:
-            self._show_preview(self.current_views['noise'])
-
-    def show_hist_view(self):
-        if not self.current_image_path:
-            return
-        if 'hist' not in self.current_views:
-            hist_img = image_histogram_pil(self.current_image_path)
-            self.current_views['hist'] = hist_img
-        self._show_preview(self.current_views['hist'])
-
-    def _show_preview(self, pil_img):
-        if pil_img is None:
-            return
-        img = pil_img.copy()
-        img.thumbnail((760, 520))
-        tkimg = ImageTk.PhotoImage(img)
-        self.preview_label.config(image=tkimg, text="")
-        self.preview_label.image = tkimg
-
-    def check_integrity(self):
-        if not self.current_image_path:
-            messagebox.showwarning("No image", "Please open an image first.")
-            return
-        exif = extract_exif_dict(self.current_image_path)
-        common = get_common_exif_fields(exif)
-        stat = Path(self.current_image_path).stat()
-        file_info = {"size_mb": stat.st_size/(1024*1024), "dimensions": self.current_image_pil.size}
-        warnings = generate_warnings(common, file_info)
-        ela_img = perform_ela_pil(self.current_image_path)
-        noise_img = None
-        try:
-            noise_img = noise_residual(self.current_image_path)
-        except:
-            pass
-        res_lines = []
-        res_lines.append("Integrity Check Results:")
-        res_lines.append(f"DateTimeOriginal: {common.get('DateTimeOriginal')}")
-        res_lines.append(f"DateTime: {common.get('DateTime')}")
-        res_lines.append(f"Make/Model: {common.get('Make')}/{common.get('Model')}")
-        res_lines.append(f"GPS: {common.get('GPS')}")
-        res_lines.append(f"Warnings: {len(warnings)}")
-        self.results_box.config(state='normal')
-        self.results_box.delete(1.0, "end")
-        for r in res_lines:
-            self.results_box.insert("end", r + "\n")
-        if warnings:
-            self.results_box.insert("end", "\nDetailed warnings:\n")
-            for w in warnings:
-                self.results_box.insert("end", " - " + w + "\n")
-            self.warning_label.config(text="⚠ Suspicious findings detected. See Analysis Results.")
+        if self.uploaded_images:
+            self.image_counter.config(text=f"Image {self.current_image_index + 1} of {len(self.uploaded_images)}")
+            self.verify_btn.config(state="normal")
         else:
-            self.warning_label.config(text="No suspicious automatic findings.")
-        self.results_box.config(state='disabled')
+            self.image_counter.config(text="No images")
+            self.verify_btn.config(state="disabled")
 
-        self.current_views['ela'] = ela_img
-        if noise_img:
-            self.current_views['noise'] = noise_img
+    def previous_image(self):
+        if self.uploaded_images and self.current_image_index > 0:
+            self.current_image_index -= 1
+            self.load_current_image()
 
-    def open_map(self):
-        if not self.current_image_path:
-            messagebox.showwarning("No image", "Load an image with GPS first.")
+    def next_image(self):
+        if self.uploaded_images and self.current_image_index < len(self.uploaded_images) - 1:
+            self.current_image_index += 1
+            self.load_current_image()
+
+    def load_current_image(self):
+        if 0 <= self.current_image_index < len(self.uploaded_images):
+            image_path = self.uploaded_images[self.current_image_index]
+            self.load_and_display_image(image_path)
+            self.update_image_info(image_path)
+            self.update_navigation_buttons()
+
+    def meta_data_analysis(self):
+        self.analysis_var.set(f"Analysis Results ▼")
+        if not self.current_image:
+            messagebox.showwarning("No Image", "Please load an image first!")
             return
-        exif = extract_exif_dict(self.current_image_path)
-        common = get_common_exif_fields(exif)
-        gps = common.get("GPS")
-        if not gps:
-            messagebox.showwarning("No GPS", "No GPS data in EXIF.")
+
+        try:
+            result = self.timeline_analyzer.analyze_image(self.current_image)
+            meta_info = "Comprehensive Metadata Analysis\n\n"
+            for key, value in result.date_time_results.items():
+                meta_info += f"{key}: {value}\n"
+            self.show_analysis_results("Meta Data Analysis", meta_info)
+        except Exception as e:
+            messagebox.showerror("Error", f"Meta data analysis failed: {str(e)}")
+
+    def timeline_analysis(self):
+        self.analysis_var.set(f"Analysis Results ▼")
+        if not self.current_image:
+            messagebox.showwarning("No Image", "Please load an image first!")
             return
-        lat, lon = gps
-        m = folium.Map(location=[lat, lon], zoom_start=16)
-        folium.Marker([lat, lon], popup=os.path.basename(self.current_image_path)).add_to(m)
-        tmp = desktop_report_folder() / "map_preview.html"
-        m.save(str(tmp))
-        webbrowser.open(str(tmp))
 
-    def generate_report(self):
-        if not self.batch_list:
-            messagebox.showwarning("No images", "Please load image(s) first.")
+        try:
+            result = self.timeline_analyzer.analyze_image(self.current_image)
+            timeline_info = "Timeline Analysis\n\n"
+            for key, value in result.date_time_results.items():
+                if "DATE" in key.upper() or "TIME" in key.upper():
+                    timeline_info += f"{key}: {value}\n"
+            self.show_analysis_results("Timeline Analysis", timeline_info)
+        except Exception as e:
+            messagebox.showerror("Error", f"Timeline analysis failed: {str(e)}")
+
+    def ai_detection_analysis(self):
+        self.analysis_var.set(f"Analysis Results ▼")
+        if not self.current_image:
+            messagebox.showwarning("No Image", "Please load an image first!")
             return
-        folder = desktop_report_folder()
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        outdir = folder / f"PicForensics_{timestamp}"
-        outdir.mkdir(parents=True, exist_ok=True)
 
-        for idx, imgpath in enumerate(self.batch_list, start=1):
-            try:
-                self.load_image(imgpath)
-                exif = extract_exif_dict(imgpath)
-                common = get_common_exif_fields(exif)
-                ela = perform_ela_pil(imgpath)
-                try:
-                    noise = noise_residual(imgpath)
-                except:
-                    noise = None
-                hist = image_histogram_pil(imgpath)
-                timeline = produce_timeline_plot(exif)
-
-                base = Path(imgpath).stem
-                copy_img_path = outdir / f"{base}_original.jpg"
-                orig_img = Image.open(imgpath).convert("RGB")
-                orig_img.save(copy_img_path, "JPEG", quality=95)
-
-                ela_path = outdir / f"{base}_ela.jpg"
-                ela.save(ela_path, "JPEG", quality=90)
-                if noise:
-                    noise_path = outdir / f"{base}_noise.jpg"
-                    noise.save(noise_path, "JPEG", quality=90)
-                hist_path = outdir / f"{base}_hist.png"
-                hist.save(hist_path, "PNG")
-                tl_path = outdir / f"{base}_timeline.png"
-                timeline.save(tl_path, "PNG")
-
-                pdf_path = outdir / f"{base}_report.pdf"
-                self._create_pdf_report(str(pdf_path), imgpath, exif, common, str(copy_img_path),
-                                        str(ela_path), str(noise_path if noise else ""), str(hist_path), str(tl_path))
-            except Exception as e:
-                print("Report error:", e)
-
-        messagebox.showinfo("Report", f"Reports and assets saved in:\n{outdir}")
-        webbrowser.open(str(outdir))
-
-    def _create_pdf_report(self, pdf_path, imgpath, exif, common, orig_copy, ela_path, noise_path, hist_path, tl_path):
-        c = canvas.Canvas(pdf_path, pagesize=A4)
-        w, h = A4
-        c.setFont("Helvetica-Bold", 16)
-        c.drawString(40, h - 50, "PicForensics - Analysis Report")
-        c.setFont("Helvetica", 10)
-        c.drawString(40, h - 70, f"Source Image: {os.path.basename(imgpath)}")
-        c.drawString(40, h - 85, f"Generated: {datetime.datetime.now().isoformat()}")
         try:
-            im = Image.open(orig_copy)
-            aspect = im.width / im.height
-            iw = 220
-            ih = iw / aspect
-            c.drawImage(ImageReader(im), 40, h - 90 - ih, width=iw, height=ih)
-        except Exception:
-            pass
+            result = self.ai_detector.analyze(self.current_image)
+            ai_info = f"AI Detection Analysis\n\n"
+            ai_info += f"AI Probability: {result['ai_probability']:.2%}\n"
+            ai_info += f"Confidence Level: {result['confidence']}\n"
+
+            if result['ai_probability'] > 0.7:
+                ai_info += "\nHIGH PROBABILITY: This image is likely AI-generated\n"
+            elif result['ai_probability'] > 0.5:
+                ai_info += "\nMODERATE PROBABILITY: Possible AI involvement\n"
+            else:
+                ai_info += "\nLOW PROBABILITY: Likely authentic human-created image\n"
+
+            self.last_ai_result = f"{result['ai_probability']:.1%} ({result['confidence']})"
+            self.show_analysis_results("AI Detection Analysis", ai_info)
+
+        except Exception as e:
+            messagebox.showerror("Error", f"AI detection analysis failed: {str(e)}")
+
+    def ela_analysis(self):
+        self.tools_var.set(f"Analysis Tools ▼")
+        if not self.current_image:
+            messagebox.showwarning("No Image", "Please load an image first!")
+            return
+
         try:
-            tl = Image.open(tl_path)
-            c.drawImage(ImageReader(tl), 300, h - 140, width=240, height=80)
-        except:
-            pass
+            ela_image = compute_ela(self.current_image)
+            if ela_image:
+                self.display_analysis_image(ela_image, "ELA Analysis")
+            else:
+                messagebox.showerror("Error", "ELA analysis failed to generate image")
+        except Exception as e:
+            messagebox.showerror("Error", f"ELA analysis failed: {str(e)}")
 
-        y = h - 250
-        c.setFont("Helvetica-Bold", 12)
-        c.drawString(40, y, "Extracted Metadata (selected)")
-        y -= 14
-        c.setFont("Helvetica", 9)
-        c.drawString(40, y, f"Make: {common.get('Make')}, Model: {common.get('Model')}")
-        y -= 12
-        c.drawString(40, y, f"DateTimeOriginal: {common.get('DateTimeOriginal')}")
-        y -= 12
-        c.drawString(40, y, f"GPS: {common.get('GPS')}")
-        y -= 20
+    def noise_analysis(self):
+        self.tools_var.set(f"Analysis Tools ▼")
+        if not self.current_image:
+            messagebox.showwarning("No Image", "Please load an image first!")
+            return
 
-        warnings = generate_warnings(common, {"size_mb": Path(imgpath).stat().st_size/(1024*1024),
-                                             "dimensions": Image.open(imgpath).size})
-        c.setFont("Helvetica-Bold", 12)
-        c.drawString(40, y, "Analysis Summary")
-        y -= 14
-        c.setFont("Helvetica", 9)
-        if warnings:
-            for wmsg in warnings:
-                c.drawString(40, y, f" - {wmsg}")
-                y -= 12
-        else:
-            c.drawString(40, y, "No automated warnings detected.")
-            y -= 12
-
-        xthumb = 40
-        ythumb = y - 10
         try:
-            ela = Image.open(ela_path)
-            ela.thumbnail((200, 150))
-            c.drawImage(ImageReader(ela), xthumb, ythumb - 150, width=200, height=150)
-            c.drawString(xthumb, ythumb - 160, "ELA")
-            xthumb += 220
-        except:
-            pass
+            noise_array = extract_noise(self.current_image)
+            noise_normalized = (noise_array - noise_array.min()) / (noise_array.max() - noise_array.min() + 1e-8)
+            noise_uint8 = (noise_normalized * 255).astype(np.uint8)
+            noise_image = Image.fromarray(noise_uint8)
+            self.display_analysis_image(noise_image, "Noise Analysis")
+        except Exception as e:
+            messagebox.showerror("Error", f"Noise analysis failed: {str(e)}")
+
+    def histogram_analysis(self):
+        self.tools_var.set(f"Analysis Tools ▼")
+        if not self.current_image:
+            messagebox.showwarning("No Image", "Please load an image first!")
+            return
+
         try:
-            if noise_path:
-                noise = Image.open(noise_path)
-                noise.thumbnail((200, 150))
-                c.drawImage(ImageReader(noise), xthumb, ythumb - 150, width=200, height=150)
-                c.drawString(xthumb, ythumb - 160, "Noise Residual")
-            xthumb += 220
-        except:
-            pass
+            import matplotlib.pyplot as plt
+            image = Image.open(self.current_image).convert("RGB")
+            plt.figure(figsize=(6, 4))
+            colors = ('red', 'green', 'blue')
+            for i, color in enumerate(colors):
+                histogram = image.getchannel(i).histogram()
+                plt.plot(histogram, color=color, alpha=0.7)
+            plt.title('RGB Histogram')
+            plt.xlabel('Pixel Value')
+            plt.ylabel('Frequency')
+            plt.legend(['Red', 'Green', 'Blue'])
+            plt.tight_layout()
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=100)
+            buf.seek(0)
+            hist_image = Image.open(buf)
+            self.display_analysis_image(hist_image, "Histogram Analysis")
+            plt.close()
+        except Exception as e:
+            messagebox.showerror("Error", f"Histogram analysis failed: {str(e)}")
 
-        c.showPage()
-        c.save()
+    def show_analysis_results(self, title, results):
+        results_window = tk.Toplevel(self.root)
+        results_window.title(title)
+        results_window.geometry("500x400")
+        results_window.configure(bg="white")
+        text_widget = tk.Text(results_window, wrap=tk.WORD, font=("Arial", 10))
+        text_widget.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        text_widget.insert(tk.END, results)
+        text_widget.config(state=tk.DISABLED)
+        close_btn = tk.Button(results_window, text="Close", command=results_window.destroy,
+                              bg="#2196f3", fg="white", font=("Arial", 10))
+        close_btn.pack(pady=10)
 
-    def show_about(self):
-        messagebox.showinfo("About", "PicForensics \nBuilt for image metadata & tamper analysis.")
+    def display_analysis_image(self, pil_image, title):
+        analysis_window = tk.Toplevel(self.root)
+        analysis_window.title(title)
+        analysis_window.geometry("600x500")
+        image_frame = tk.Frame(analysis_window)
+        image_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        display_image = pil_image.copy()
+        display_image.thumbnail((550, 400), Image.Resampling.LANCZOS)
+        photo = ImageTk.PhotoImage(display_image)
+        image_label = tk.Label(image_frame, image=photo)
+        image_label.image = photo
+        image_label.pack(expand=True)
+        close_btn = tk.Button(analysis_window, text="Close", command=analysis_window.destroy,
+                              bg="#2196f3", fg="white", font=("Arial", 10))
+        close_btn.pack(pady=10)
 
-def main():
-    root = Tk()
-    app = PicForensicsApp(root)
-    root.mainloop()
+    def open_image(self):
+        file_paths = filedialog.askopenfilenames(
+            title="Select Images",
+            filetypes=[("Image files", "*.jpg *.jpeg *.png *.gif *.bmp")]
+        )
+        if file_paths:
+            new_images = list(file_paths)
+            self.uploaded_images.extend(new_images)
+            if self.current_image_index == -1:
+                self.current_image_index = 0
+            self.load_current_image()
+
+    def load_and_display_image(self, file_path):
+        self.image_placeholder.pack_forget()
+        image = Image.open(file_path)
+        frame_width = 380
+        frame_height = 280
+        image.thumbnail((frame_width, frame_height), Image.Resampling.LANCZOS)
+        photo = ImageTk.PhotoImage(image)
+        if self.image_label:
+            self.image_label.destroy()
+        self.image_label = tk.Label(self.image_frame, image=photo, bg='white')
+        self.image_label.image = photo
+        self.image_label.pack(expand=True)
+        self.current_image = file_path
+
+    def update_image_info(self, file_path):
+        try:
+            file_size = os.path.getsize(file_path) / (1024 * 1024)
+            file_name = os.path.basename(file_path)
+            file_ext = os.path.splitext(file_name)[1].upper().replace(".", "")
+            self.info_labels["File Size"].config(text=f"{file_size:.2f}MB")
+            self.info_labels["File Format"].config(text=file_ext)
+            self.info_labels["File Path"].config(text=file_path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not get image info: {str(e)}")
+
+    def delete_image(self):
+        if not self.current_image:
+            messagebox.showwarning("Delete Image", "No image to delete!")
+            return
+        result = messagebox.askyesno("Delete Image", "Are you sure you want to delete this image?")
+        if result:
+            if 0 <= self.current_image_index < len(self.uploaded_images):
+                self.uploaded_images.pop(self.current_image_index)
+                if self.uploaded_images:
+                    if self.current_image_index >= len(self.uploaded_images):
+                        self.current_image_index = len(self.uploaded_images) - 1
+                    self.load_current_image()
+                else:
+                    if self.image_label:
+                        self.image_label.destroy()
+                        self.image_label = None
+                    self.image_placeholder.pack(expand=True)
+                    for key in self.info_labels:
+                        self.info_labels[key].config(text="No image loaded")
+                    self.current_image = None
+                    self.current_image_index = -1
+                    self.update_navigation_buttons()
+            messagebox.showinfo("Delete Image", "Image deleted successfully!")
+
 
 if __name__ == "__main__":
-    main()
+    root = tk.Tk()
+    app = PicForensicsApp(root)
+    root.mainloop()
